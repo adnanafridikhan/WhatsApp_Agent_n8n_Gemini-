@@ -1,0 +1,514 @@
+{
+  "name": "2ND agent Personal  - Gemini AI (Final)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "seconds",
+              "secondsInterval": 20
+            }
+          ]
+        }
+      },
+      "id": "b84a91d4-900d-4a1a-a330-f05a19b13bbf",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        368,
+        144
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Lock + backoff + rate-limit guard + build poll URL\nconst s = $getWorkflowStaticData('global');\nconst now = Date.now();\nconst LOCK_TTL = 90000;\n\nif (s.nextAllowedPoll && now < s.nextAllowedPoll) {\n  return [{ json: { canPoll: false, reason: 'backoff', waitMs: s.nextAllowedPoll - now } }];\n}\nif (s.pollLock && now - s.pollLock < LOCK_TTL) {\n  return [{ json: { canPoll: false, reason: 'previous run still active' } }];\n}\ns.pollTimes = (s.pollTimes || []).filter(t => now - t < 60000);\nif (s.pollTimes.length >= 15) {\n  return [{ json: { canPoll: false, reason: 'poll rate limit (15/min)' } }];\n}\ns.pollTimes.push(now);\ns.pollLock = now;\n\n// Manual query string construction (No URLSearchParams required)\nif (s.startedAt === undefined) s.startedAt = Math.floor(Date.now() / 1000);\nconst off = (s.offset !== undefined && s.offset !== null && s.offset !== '') ? s.offset : 0;\nconst queryStr = 'limit=50&timeout=15&offset=' + encodeURIComponent(String(off));\n\nreturn [{ \n  json: { \n    canPoll: true, \n    pollUrl: 'https://api.whatsapp.com/agent/v1/updates?' + queryStr, \n    offsetUsed: s.offset ?? null \n  } \n}];"
+      },
+      "id": "ba3c3e02-6feb-4472-809e-b5630db83fbd",
+      "name": "Prepare Poll Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        592,
+        144
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "860b2bf5-17dc-44a5-bbfe-3ddedbb127d7",
+              "leftValue": "={{ $json.canPoll }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "60f47b45-dc41-41af-9887-2bebee499b61",
+      "name": "Can Poll?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        816,
+        144
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.pollUrl }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 35000
+        }
+      },
+      "id": "369d1dbf-21c9-4038-95bc-c7e795389bfd",
+      "name": "HTTP Request - Get WhatsApp Updates",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1040,
+        128
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ZWDI8OkxgwWiL48w",
+          "name": "Header Auth account 4"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Handle status codes, save offset, dedupe, emit text messages\nconst s = $getWorkflowStaticData('global');\nconst r = $input.first().json || {};\nconst status = Number(r.statusCode ?? r.status ?? 0);\nconst headers = r.headers || {};\nlet body = r.body;\nif (typeof body === 'string' && body.trim()) { try { body = JSON.parse(body); } catch (e) { body = {}; } }\nif (!body || typeof body !== 'object') body = {};\n\nfunction backoff(ms, why) {\n  s.failCount = (s.failCount || 0) + 1;\n  s.nextAllowedPoll = Date.now() + ms;\n  s.lastError = { at: new Date().toISOString(), status, why };\n  console.log('[WA-AGENT] poll problem', status, why, 'backoff ms:', ms);\n}\nconst expo = () => Math.min(300000, 5000 * Math.pow(2, Math.min(s.failCount || 0, 6)));\n\nif (status === 200) {\n  s.failCount = 0; s.nextAllowedPoll = 0;\n} else if (status === 204) {\n  s.failCount = 0; s.nextAllowedPoll = 0;\n  return [{ json: { hasMessages: false, status } }];\n} else if (status === 429) {\n  const ra = Number(headers['retry-after'] || headers['Retry-After'] || 0) * 1000;\n  backoff(Math.max(60000, ra), 'rate limited');\n  return [{ json: { hasMessages: false, status } }];\n} else if (status === 409) {\n  backoff(30000, 'conflict: another poll active for this agent');\n  return [{ json: { hasMessages: false, status } }];\n} else if (status === 401 || status === 403) {\n  backoff(300000, 'auth/permission error - check WhatsApp Agent token');\n  return [{ json: { hasMessages: false, status } }];\n} else {\n  backoff(expo(), status === 503 ? 'service unavailable' : 'unexpected status/network error');\n  return [{ json: { hasMessages: false, status } }];\n}\n\n// FIX 1: Offset update from payload OR fallback to highest message ID\nif (body.next_offset !== undefined && body.next_offset !== null) {\n  s.offset = body.next_offset;\n} else if (body.offset !== undefined && body.offset !== null) {\n  s.offset = body.offset;\n}\n\n// FIX 2: Initialize processedIds and handle first-run bootstrapping\n   const isFirstRun = false;\ns.processedIds = s.processedIds || [];\nconst seen = new Set(s.processedIds);\n\nconst out = [];\nconst msgs = [];\n\nfor (const e of (Array.isArray(body.entry) ? body.entry : [])) {\n  for (const c of (e.changes || [])) {\n    for (const m of ((c.value && c.value.messages) || [])) {\n      msgs.push(m);\n    }\n  }\n}\n\n// FIX 3: Time filter threshold (e.g., ignore messages older than 3 minutes / 180s)\nconst NOW_SEC = Math.floor(Date.now() / 1000);\nconst MAX_AGE_SECONDS = 600;\n\nfor (const m of msgs) {\n  if (!m || !m.id || !m.from) continue;\n\n  // Deduplication check\n  if (seen.has(m.id)) continue;\n  seen.add(m.id);\n  s.processedIds.push(m.id);\n\n  // If this is the initial run on node restart, seed old IDs and skip execution\n  if (isFirstRun) continue;\n\n  // Check timestamp age\n  const msgTime = Number(m.timestamp || 0);\n  if (msgTime > 0 && (NOW_SEC - msgTime) > MAX_AGE_SECONDS) {\n    console.log(`[WA-AGENT] Skipping old message ID: ${m.id}`);\n    continue;\n  }\n\n  if (m.type !== 'text') continue;\n  const text = (m.text && typeof m.text === 'object') ? m.text.body : m.text;\n  if (typeof text !== 'string' || !text.trim()) continue;\n\n  out.push({ json: { hasMessages: true, from: String(m.from), messageId: m.id, text } });\n}\n\n// Mark first run as completed\ns.isInitialized = true;\n\n// Keep sliding window of processed IDs\nif (s.processedIds.length > 500) s.processedIds = s.processedIds.slice(-500);\n\nreturn out.length ? out : [{ json: { hasMessages: false, status } }];"
+      },
+      "id": "52869d69-bff7-4e62-951a-40a4f886fc5a",
+      "name": "Process Updates and Save Offset",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1248,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "5cf84ac2-0657-4c83-87a3-902921448572",
+              "leftValue": "={{ $json.hasMessages }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "971333d5-08a5-4cc3-b63a-852d1a2d76a4",
+      "name": "Filter Incoming Text Messages",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1472,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "2bbc841e-6c7a-498e-8a24-e5c706f4f015",
+      "name": "Loop Over Incoming Messages",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1760,
+        -96
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.text }}",
+        "options": {
+          "systemMessage": "Your my assistent my name xyz . reply simple roman urdu"
+        }
+      },
+      "id": "c22b6f0e-8710-4774-9486-c94a9167f4be",
+      "name": "AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        2032,
+        -112
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.5-flash-lite",
+        "options": {
+          "temperature": 0.4
+        }
+      },
+      "id": "ebaa768f-be0b-4c3f-ab12-4a3f8e6358da",
+      "name": "Google Gemini Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        1888,
+        240
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "jpoqOfTysOlEPZmp",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $json.from }}",
+        "contextWindowLength": 10
+      },
+      "id": "d8f73cdf-2af1-47cd-94ae-236d93161654",
+      "name": "Simple Memory",
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [
+        2144,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.whatsapp.com/agent/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ messaging_product: 'whatsapp', to: $('Loop Over Incoming Messages').item.json.from, type: 'text', text: { body: String($json.output || 'Maaf kijiye, abhi jawab nahi de saka. Thori der baad dobara try karein.').slice(0, 4096) } }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 20000
+        }
+      },
+      "id": "5406db9c-aade-448a-bed9-9276a69c96f8",
+      "name": "HTTP Request - Send WhatsApp Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2352,
+        -112
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ZWDI8OkxgwWiL48w",
+          "name": "Header Auth account 4"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Log outbound result; back off polling on auth errors\nconst s = $getWorkflowStaticData('global');\nconst r = $input.first().json || {};\nconst status = Number(r.statusCode ?? r.status ?? 0);\nif (status >= 200 && status < 300) {\n  s.lastSend = { at: new Date().toISOString(), status };\n} else {\n  s.lastError = { at: new Date().toISOString(), status, why: 'send failed', detail: r.error || r.body || null };\n  console.log('[WA-AGENT] send failed', status, JSON.stringify(s.lastError.detail));\n  if (status === 401 || status === 403) s.nextAllowedPoll = Date.now() + 300000;\n  if (status === 429) s.nextAllowedPoll = Date.now() + 60000;\n}\nreturn [{ json: { sendStatus: status } }];"
+      },
+      "id": "ddd0a078-422c-463a-b63e-8e1b40925d7e",
+      "name": "Log Send Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2624,
+        -96
+      ]
+    },
+    {
+      "parameters": {
+        "amount": 6
+      },
+      "id": "a2109529-e410-498b-8437-d2a3e12ef4ba",
+      "name": "Wait (Send Rate Limit)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2768,
+        208
+      ],
+      "webhookId": "c1bc6441-63fb-4d4a-94b2-d3265a324366"
+    },
+    {
+      "parameters": {
+        "jsCode": "const s = $getWorkflowStaticData('global');\ns.pollLock = 0;\nreturn [{ json: { released: true } }];"
+      },
+      "id": "f6257198-3fa8-4f8d-aeb6-33f7bc815659",
+      "name": "Release Poll Lock",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1824,
+        640
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "7060e05b-518c-4b96-9b36-90e30bace544",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        368,
+        544
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const s = $getWorkflowStaticData('global');\ns.pollLock = 0;\ns.lastError = { at: new Date().toISOString(), why: 'workflow error', detail: JSON.stringify($input.first().json).slice(0, 500) };\nconsole.log('[WA-AGENT] workflow error', s.lastError.detail);\nreturn [{ json: { logged: true } }];"
+      },
+      "id": "f4a6447d-c658-4f19-a15d-36c02b144bde",
+      "name": "Log Error and Release Lock",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        592,
+        544
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Prepare Poll Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Poll Request": {
+      "main": [
+        [
+          {
+            "node": "Can Poll?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Can Poll?": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request - Get WhatsApp Updates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request - Get WhatsApp Updates": {
+      "main": [
+        [
+          {
+            "node": "Process Updates and Save Offset",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Updates and Save Offset": {
+      "main": [
+        [
+          {
+            "node": "Filter Incoming Text Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Incoming Text Messages": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Incoming Messages",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Release Poll Lock",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Incoming Messages": {
+      "main": [
+        [
+          {
+            "node": "Release Poll Lock",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request - Send WhatsApp Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simple Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request - Send WhatsApp Reply": {
+      "main": [
+        [
+          {
+            "node": "Log Send Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Send Result": {
+      "main": [
+        [
+          {
+            "node": "Wait (Send Rate Limit)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait (Send Rate Limit)": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Incoming Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Log Error and Release Lock",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "5a85e504-9ad6-423b-a5a8-45fa352f170c",
+  "meta": {
+    "instanceId": "9ec9b87e4d0d28c6b62ca637a0916e677e27a69d0d3fb7f34f363018ab48a730"
+  },
+  "nodeGroups": [],
+  "id": "h0SiN2uXrV8ncE8G",
+  "tags": []
+}
